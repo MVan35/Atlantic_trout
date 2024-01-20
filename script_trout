@@ -1,0 +1,718 @@
+# data available on figshare
+
+library(LEA)
+library(NLMR)
+library(raster)
+library(sdmpredictors)
+library(leaflet)
+library(raster)
+library(gradientForest)
+library(vegan)
+library(ResistanceGA)
+library(spdep)
+library(rmaxent)
+library(rJava)
+library(dismo)
+library(adegenet)
+library(poppr)
+library(resGF)
+
+
+################################################################################
+## 1.1	Population structure
+library(graph4lg)
+# x - 2,744 individuals; 185 loci; 382 alleles
+x <- read.genepop("94_pops_no_hatch.gen", ncode = 2L)
+# clean data
+xx <- missingno(x, type = "genotype", cutoff = 0.1, quiet = FALSE, freq = FALSE)
+xx <- missingno(xx, type = "loci", cutoff = 0.05, quiet = FALSE, freq = FALSE)
+xx_ <- missingno(xx, type = "mean", quiet = FALSE, freq = FALSE)
+
+# metadata
+sample.coord <- read.table("path", header=T, stringsAsFactors=F, sep="\t")
+
+X <- genind2genpop(xx_)
+X$other$xy <- sample.coord[,c('Longitude','Latitude')]
+
+# set-up clipped_stqck
+#first import all files in a single folder as a list 
+rastlist <- list.files(path = "path", pattern='.tif$', 
+                       all.files=TRUE, full.names=FALSE)
+#import all raster files in folder using lapply
+clipped_stack <- stack(paste0(raster_dir, rastlist))
+
+
+#########################################################################
+## genetic statistics
+library(graph4lg)
+## Population wide ##
+pop <- unique(sample.coord)
+# calculate indices
+df_pop_indices <- pop_gen_index(x = xx, pop_names = sample.coord$Pop, indices = c("Nb_ind", "A", "He", "Ho"))
+
+# calculate DPS
+Dps <- mat_gen_dist(x = xx, dist = "DPS")
+mat_dps <- as.matrix(Dps)
+
+# Fst
+myfst <- mat_gen_dist(x = xx, dist = "FST")
+myfst_lin <- mat_gen_dist(x = xx, dist = "FST_lin")
+
+# PCA
+pca1 <- dudi.pca(X, scale = FALSE, scannf = FALSE, nf = 3)
+
+
+
+###############################################################################
+# 4.4 Discriminant Analysis of Principal Components (DAPC)
+dapc1 <- dapc(xx, n.pca=10, n.da=1)
+
+scatter(dapc1,scree.da=FALSE, bg="white", posi.pca="topright", legend=TRUE,
+        txt.leg=paste("group", 1:2), col=c("red","blue"))
+compoplot(dapc1, col=c("red","blue"),lab="", txt.leg=paste("group", 1:2), ncol=2)
+
+dapc.trout <- dapc(xx, grp=xx$pop)
+pdf(paste0(out_scenario, "/dapc_trout.pdf"))
+scatter.dapc(dapc.trout)
+dev.off()
+
+# check the genetic structures & compare with populations
+grp <- find.clusters(xx ,max.n.clust=55, n.pca = numPCs)
+mytable <- table(pop(xx), grp$grp)
+
+
+
+
+##############################################
+# create a resistance surface using resistantGF
+library(pegas)
+clim.points <- raster::extract(clipped_stack, sample.coord[,c('Longitude','Latitude')])
+sample.k <- SpatialPoints(sample.coord[,c('Longitude','Latitude')])
+
+crs.wgs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+sample.pts <- sample.coord[,c('Longitude','Latitude')]
+rownames(sample.pts) <- sample.coord_xx$id
+xx$other$xy<- sample.coord[,c('Longitude','Latitude')]
+rownames(xx$other$xy) <- rownames(sample.pts) 
+
+p <- as.data.frame(xx$pop)
+names(p) <- 'Pop'
+mysamples <- as.data.frame(sample.k@coords)
+p$ID <- rownames(sample.pts)
+snp <- xx$tab
+coords <-  clim.points[,c('Longitude', 'Latitude')]
+id <- To.From.ID(nrow(coords))
+
+# Gradient Forest
+pcnm <- pcnm(dist(clim.points[,c('Longitude', 'Latitude')]))  #this generates the PCNMs, you could stop here if you want all of them
+keep <- round(length(which(pcnm$value > 0))/2)
+pcnm.keep <- scores(pcnm)[,1:keep]  #keep half of positive ones as suggested by some authors
+
+nbvar <- length(colnames(clim.points))
+env.gf <- cbind(clim.points[ , c(seq(3, nbvar, by=1)) ], pcnm.keep[,c(1:5)])
+library(gradientForest)
+maxLevel <- log2(0.368*nrow(env.gf)/2)
+env.gf <- as.data.frame(env.gf)
+snp <- as.data.frame(snp)
+
+print(paste0("## performing gradient forest #"))
+gf_final <- gradientForest(cbind(env.gf, snp), predictor.vars=colnames(env.gf), response.vars=colnames(snp), ntree=500, maxLevel=maxLevel, trace=T, corr.threshold=0.50)
+resistance_map <- resGF(gf_final, clipped_stack, save.image = T, GF_env_variables)
+
+
+########################################
+# Genetic graphs
+res_dmc <- dist_max_corr(mat_gd = mat_dps, mat_ld = mat_ld, interv = 2)
+# res_dmc <- dist_max_corr(mat_gd = myfst, mat_ld = mat_ld, interv = 10)
+res_dmc$plot_dmc
+myDMC <- res_dmc$`distance at which correlation reaches a maximum` # distance of maximum correlation (DMC)
+myDMC
+g_thr <- gen_graph_thr(mat_dps, mat_ld, thr = 320, mode = "larger")
+plot(g_thr, main="threshold graph")
+colnames(mat_ld) <- colnames(mat_dps)
+rownames(mat_ld) <- rownames(mat_dps)
+scatter_dist_g(mat_dps, mat_ld, g_thr)
+
+
+library(popgraph)
+library(igraph)
+single_r <- single_r43
+# X$other$xy <- sample.p@coords
+mygraph <- g_thr
+V(mygraph)$Latitude <- X$other$xy[,2]
+V(mygraph)$Longitude <- X$other$xy[,1]
+gg <- as.popgraph(mygraph)
+gg.nodes <- to_SpatialPoints(gg)
+gg.edges <- to_SpatialLines(gg)
+plot(resistance_map)
+plot( gg.edges, add=TRUE, col="#555555" ,cex=0.1)
+# plot( gg.nodes, add=TRUE, col="red", pch =16)
+colorplot(X$other$xy, pca1$li, axes = 1:2, transp = F, add = TRUE, cex = 1.5)
+
+# get TransitionLayer
+library(gdistance)
+sample_pop.k <- SpatialPoints(sample_pop)
+tr <- transition(resistance_surface, transitionFunction=function(x) 1/mean(x), directions = 8)
+trC <- geoCorrection(tr, "c", scl = TRUE)
+
+### ### ### ### ### ### ### ### ### ### ### ### 
+### getting cost using resistance surface
+# create LCP matrice
+library(gdistance)
+tr <- transition(resistance_map, transitionFunction=function(x) 1/mean(x), directions = 8)
+trC <- geoCorrection(tr, "c", scl = TRUE)
+cosDist_GF <- costDistance(trC, sample_pop.k)
+ecoMat_GF <- as.matrix(cosDist_GF)
+res_dmc <- dist_max_corr(mat_gd = mat_dps, mat_ld = cosDist_GF, interv = 1) # res
+res_dmc$plot_dmc
+myDMC <- res_dmc$`distance at which correlation reaches a maximum` # distance of maximum correlation (DMC)
+myDMC
+
+g_thr <- gen_graph_thr(mat_dps, cosDist_GF, thr = myDMC, mode = "larger")
+plot(g_thr, main="threshold graph")
+mat_ld <- as.matrix(cosDist_GF)
+rownames(mat_ld) <- rownames(mat_dps)
+colnames(mat_ld) <- rownames(mat_dps)
+scatter_dist_g(mat_dps, mat_ld, g_thr)
+
+
+########################################
+# Fig. 4
+# Gene flow of Salmo trutta in the English Channel 
+
+# Genetic graphs
+mat_ld <- sp::spDists(coords_m,longlat = TRUE) # Another option is to calculate the GreatCircle distance.
+res_dmc <- dist_max_corr(mat_gd = mat_dps, mat_ld = mat_ld, interv = 2)
+# res_dmc <- dist_max_corr(mat_gd = myfst, mat_ld = mat_ld, interv = 10)
+pdf(paste0(out_scenario, "/plot_dmc.pdf"))
+
+plot(res_dmc$plot_dmc, xlab = 50, ylab = 12, cex.axis = 1)
+dev.off()
+myDMC <- res_dmc$`distance at which correlation reaches a maximum` # distance of maximum correlation (DMC)
+myDMC
+g_thr <- gen_graph_thr(mat_dps, mat_ld, thr = myDMC, mode = "larger")
+plot(g_thr, main="threshold graph")
+colnames(mat_ld) <- colnames(mat_dps)
+rownames(mat_ld) <- rownames(mat_dps)
+
+
+
+lat_lon_pop <- as.data.frame(cbind(pop$Longitude, pop$Latitude))
+sample.p <- SpatialPoints(lat_lon_pop)
+
+
+# generate dispertion route map
+library(reshape2)
+library(gdistance)
+tr <- transition(single_r39_mean, transitionFunction=function(x) 1/mean(x), directions = 8)
+trC <- geoCorrection(tr, "c", scl = TRUE)
+cost_ld <- as.matrix(costDistance(trC, sample_pop.k))
+
+
+
+# Convert the distance matrix to a dataframe
+rownames(cost_ld) <- rownames(mat_ld)
+colnames(cost_ld) <- colnames(mat_ld)
+pop_distance <- setNames(melt(cost_ld), c('pop1', 'pop2', 'distance'))
+head(pop_distance)
+
+data1 <- pop_distance
+# for-Loop Over Rows of Data Frame
+# # https://statisticsglobe.com/loop-through-data-frame-columns-rows-in-r/
+# res_dmc <- dist_max_corr(mat_gd = mat_dps, mat_ld = cost_ld, interv = 2)
+# res_dmc$plot_dmc # should be 13
+# myDMC <- res_dmc$`distance at which correlation reaches a maximum` # distance of maximum correlation (DMC)
+# myDMC
+# Iterate over rows and print values when distance is below 10
+pdf(paste0(out_scenario, "/Fig4_cost14.pdf"))
+plot(single_r39_mean)
+for (i in 1:nrow(data1)) {
+  if (data1$distance[i] < 14) {
+    tmp1 <- data1$pop1[i]
+    tmp2 <- data1$pop2[i]
+    cat("pop1:", data1$pop1[i], "pop2:", data1$pop2[i], "distance:", data1$distance[i], "\n")
+    plot(shortestPath(trC, sample_pop.k[tmp1,], sample_pop.k[tmp2,],  output="SpatialLines"), lwd = 0.8,add=TRUE)
+  }
+}
+colorplot(coords,mySpca$li,axes =1:2, transp=TRUE, cex=2, add = TRUE)
+dev.off()
+colorplot(coords_m,pca1_pop$l1,axes =1:2, transp=TRUE, cex=1, add = TRUE)
+
+g_thr <- gen_graph_thr(mat_dps, cost_ld, thr = 13, mode = "larger")
+plot(g_thr, main="threshold graph")
+scatter_dist_g(mat_dps, cost_ld, g_thr)
+
+##################################################################
+# Fig 5
+# RDA
+clim.points <- raster::extract(clipped_stack, sample.coord[,c('Longitude','Latitude')])
+EnvData <- as.data.frame(clim.points)
+
+## implementing RDA
+# https://popgen.nescent.org/2018-03-27_RDA_GEA.html
+library(vegan)    # Used to run RDA
+
+# fig 5
+myrda <- rda(xx_$tab ~ BO_ph + BO2_silicateltmin_ss + BO_dissox + BO2_nitraterange_ss + humanImpact_land +
+               humanImpact_sea + ke_currents + fishing_density + substrate +  vessels_traffic +
+               BO2_silicaterange_bdmax + NorthSouth_Aspect + Annual_range_in_SSS + BO2_lightbotmean_bdmax +
+               humanImpact_land + BO2_tempmin_bdmin,  EnvData)
+# myano <- anova(myrda)
+vif.cca(myrda) # All values are below 10, and most are below 5, which indicates that multicollinearity among these predictors shouldn’t be a problem for the model.
+RsquareAdj(myrda)
+summary(eigenvals(myrda, model = "constrained"))
+
+# Plot the RDA
+plot(myrda, scaling=3)          # default is axes 1 and 2
+plot(myrda, choices = c(1, 3), scaling=3)  # axes 1 and 3
+
+# looking at substrate
+EnvData$ecotype <- sample.coord_eco$ecotype
+eco <- as.factor(EnvData$ecotype)
+# bg <- c("#ff7f00","#1f78b4","#ffff33","#a6cee3","#33a02c","#e31a1c", "pink", "green")
+bg <- c("red", "brown", "orange", "lightgreen", "pink", "darkgreen", "aquamarine4", "blue")
+
+# order 9 pop
+bg <- c("darkblue", "darkorchid4", "lightpink2","red", "yellow" ,"chartreuse3", "darkgrey", "darkorange", "burlywood4")
+
+# RDA 1-2
+plot(myrda, type="n", scaling=3, xlab = "RDA 1", ylab = "RDA 2", cex.axis = 1.2 ) # default is axes 1 and 2
+text(myrda, scaling=3, display="bp", col="#0868ac", cex=1.5, head.arrow = 0.1, arrow.mul) # no label
+points(myrda, display="sites", pch=21, cex=1.3, col="gray32", scaling=3, bg=bg[eco]) # the wolves
+
+plot(myrda, type="n", scaling=3)
+points(myrda, display="sites", pch=21, cex=2, col="gray32", scaling=3, bg=bg[eco]) # water mouths
+text(myrda, scaling=3, display="bp", col="#0868ac", cex=1.5, head.arrow = 0.1, arrow.mul) # no label
+text(myrda, scaling=3, display="bp", col="#0868ac", cex=0.7, head.arrow = 0.05)
+
+# Legend
+# Create an empty plot without any data
+bg <- c("darkblue", "darkorchid4", "lightpink2","red", "yellow" ,"chartreuse3", "darkgrey", "darkorange", "burlywood4")
+bg_order <- c("darkorange", "darkgrey", "yellow","burlywood4", "red" ,"lightpink2", "darkorchid4", "darkblue", "burlywood4")
+plot(0, type = "n", xlab = "", ylab = "", xlim = c(0, 2), ylim = c(0, 2), axes = FALSE)
+legend("bottomright", legend=levels(eco), bty="n", col="gray32", pch=21, cex=1, pt.bg=bg_order)
+
+
+
+############################################
+## Prioritization
+# example beloz but see - https://prioritizr.net/
+
+# getting a subset of data
+library(rgdal)
+channel_shp <- readOGR(paste0(out_scenario, "/prioritization/english_channel/iho.shp"))
+
+library(climateStability)
+connectivity_map <- 1 - resistance_map
+plot(connectivity_map)
+
+# create plot(an empty raster)
+r <- raster(ncol=105, nrow=78)
+#r <- raster(ncol=51, nrow=38)
+#r <- raster(ncol=60, nrow=45)
+extent(r) <- extent(clipped_stack$Annual_range_in_SST)
+crs(r) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+values(r) <- 1
+
+plot(r)
+r.crop <- crop(r, e, snap="out")
+
+reduced_bathy.crop <- projectRaster(bathy.crop, r.crop, method = 'ngb')
+r.mask <- mask(r.crop, clipped_stack$Annual_variance_in_SST)
+r.mask <- raster::mask(r.crop, reduced_bathy.crop)
+r.mask_channel <- mask(r.crop, channel_shp)
+
+# The planning units can be a spatial polygon layerânot a rasterâand so there can be
+# considerable flexibility in the shape of the planning units.
+# NB - Vector-based planning unit data generally require more time to complete pre-processing computation
+r_tu <- rasterToPolygons(r.mask, fun=NULL, n=4, na.rm=TRUE, digits=12, dissolve=FALSE)
+r_tu <- rasterToPolygons(r.mask_channel, fun=NULL, n=4, na.rm=TRUE, digits=12, dissolve=FALSE)
+colnames(r_tu@data)[1] = "cost"
+
+spplot(r_tu)
+
+# scenario 1
+# build problem
+library(prioritizr)
+prio <- projectRaster(connectivity_map, r.crop, method = 'ngb')
+prio <- projectRaster(connectivity_map, r.mask_channel, method = 'ngb') # channel
+coonectivity.mask <- raster::mask(prio, r.mask_channel)
+
+
+# r_tu - cell values denote land acquisition costs
+# prio - the cell values denote the relative abundance of individuals, with higher values indicating greater abundance.
+p1 <- problem(r_tu, prio, cost_column = "cost") %>%
+  add_min_set_objective() %>%
+  add_relative_targets(0.17) %>%
+  add_binary_decisions() %>%
+  add_default_solver(gap = 0)
+
+## solve problem
+require(lpsymphony)
+s1 <- solve(p1)
+
+# visualize solution
+s1$solution_1 <- factor(s1$solution_1)
+spplot(s1, "solution_1", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution")
+
+# rasterize data
+r <- raster(s1, res=res(bathy.crop))
+r.polys <- rasterize(s1, r, field = s1@data[,2], fun = "mean", update = TRUE, updateValue = "NA")
+r.mask_s1 <- mask(r.polys, channel_shp)
+plot(r.mask_s1)
+plot(mycountry.crop, add=T)
+plot(mycountry.crop)
+plot(r.mask_s1, add=T)
+plot(mycountry.crop, add=T)
+
+pdf(paste0(out_scenario, "/prio_scenario1_channel.pdf"))
+plot(mycountry.crop)
+plot(r.mask_s1, add=T)
+plot(mycountry.crop, add=T)
+dev.off()
+
+
+# create new problem with boundary penalties added to it
+p2 <- p1 %>%
+  add_boundary_penalties(penalty = 1, edge_factor = 0.5)
+# Here we will use a penalty factor of 300 (i.e. boundary length modifier; BLM), and an edge factor of 50% so that planning units that occur outer edge of the study area are not overly penalized
+s2 <- solve(p2)
+s2$solution_2 <- factor(s2$solution_1)
+
+r <- raster(s2, res=res(bathy.crop))
+r.polys <- rasterize(s2, r, field = s2@data[,3], fun = "mean", update = TRUE, updateValue = "NA")
+r.mask_s2 <- mask(r.polys, channel_shp)
+col <- c("grey90", "darkgreen")
+
+pdf(paste0(out_scenario, "/prioritization/spplot_s1_s2.pdf"))
+spplot(s2, "solution_2", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution", add= T)
+dev.off()
+
+pdf(paste0(out_scenario, "/prio_scenario1b_channel.pdf"))
+plot(mycountry.crop)
+plot(r.mask_s2, col=col, add=T)
+plot(mycountry.crop, add=T)
+dev.off()
+
+
+## scenario #2 - myfish_mask_rev
+# high cost <- low fishing density values
+# low cost <- high fishing density values
+myfish <- clipped_stack$fishing_density
+values(myfish)[values(myfish) > 0.1] <- 0.1 # remove extreme values
+myfish <- rescale0to1(myfish)
+hist(myfish, breaks=100)
+pdf(paste0(out_scenario, "/myfish_density.pdf"))
+plot(myfish)
+plot(mycountry.crop, add = T)
+dev.off()
+# r <- raster(ncol=26, nrow=19)
+# r <- raster(ncol=51, nrow=38)
+r <- raster(ncol=60, nrow=45)
+extent(r) <- extent(clipped_stack$Annual_range_in_SST)
+crs(r) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+values(r) <- 1
+r.mask_channel <- mask(r, channel_shp)
+
+myfish.crop <- projectRaster(myfish, r.mask_channel, method = 'ngb')
+myfish_mask <- mask(myfish.crop, r.mask_channel)
+myfish_mask <- rescale0to1(myfish_mask)
+
+# Use myfish_mask_rev - to minimize the cost on fishing
+myfish_mask_rev <- 1 -  myfish_mask
+hist(myfish_mask_rev, breaks=100)
+
+
+r_tu <- rasterToPolygons(myfish_mask_rev, fun=NULL, n=4, na.rm=TRUE, digits=12, dissolve=FALSE)
+colnames(r_tu@data)[1] = "cost"
+
+spplot(r_tu, "cost", main = "fishing")
+spplot(coonectivity.mask)
+
+# plot(r_tu)
+# build problem
+prio <- projectRaster(connectivity_map, r.mask_channel, method = 'ngb') # channel
+
+library(prioritizr)
+col <- c("grey90", "darkgreen")
+p1 <- problem(r_tu, prio, cost_column = "cost") %>%
+  add_min_set_objective() %>%
+  add_relative_targets(0.17) %>% # should be 17?
+  add_binary_decisions() %>%
+  add_default_solver(gap = 0)
+
+## solve problem
+require(lpsymphony)
+s1 <- solve(p1)
+
+# visualize solution
+s1$solution_1 <- factor(s1$solution_1)
+spplot(s1, "solution_1", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution", add= T)
+
+# rasterize data
+r <- raster(s1, res=res(bathy.crop))
+r.polys <- rasterize(s1, r, field = s1@data[,2], fun = "mean", update = TRUE, updateValue = "NA")
+r.mask_s1 <- mask(r.polys, channel_shp)
+plot(mycountry.crop)
+plot(r.mask_s1, col=col, add=T)
+plot(mycountry.crop, add=T)
+
+
+
+plot(mycountry.crop)
+plot(r.mask_s1, col=col, add=T)
+plot(mycountry.crop, add=T)
+
+
+# create new problem with boundary penalties added to it
+p2 <- p1 %>%
+  add_boundary_penalties(penalty = 1, edge_factor = 0.5)
+# Here we will use a penalty factor of 300 (i.e. boundary length modifier; BLM), and an edge factor of 50% so that planning units that occur outer edge of the study area are not overly penalized
+s2 <- solve(p2)
+s2$solution_2 <- factor(s2$solution_1)
+
+r <- raster(s2, res=res(bathy.crop))
+r.polys <- rasterize(s2, r, field = s2@data[,3], fun = "mean", update = TRUE, updateValue = "NA")
+r.mask_s2 <- mask(r.polys, channel_shp)
+
+# pdf(paste0(out_scenario, "/prioritization/spplot_s2b_s2.pdf"))
+spplot(s2, "solution_2", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution", add= T)
+# dev.off()
+
+pdf(paste0(out_scenario, "/prioritization/spplot_fishing_inv_prio.pdf"))
+spplot(s2, "solution_2", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution", add= T)
+dev.off()
+
+
+
+plot(mycountry.crop)
+plot(r.mask_s2, col=col, add=T)
+plot(mycountry.crop, add=T)
+
+
+
+
+
+## scenario #2b - myfish_mask
+# high cost <- high fishing density values
+# low cost <- low fishing density values
+myfish <- clipped_stack$fishing_density
+values(myfish)[values(myfish) > 0.1] <- 0.1 # remove extreme values
+myfish <- rescale0to1(myfish)
+hist(myfish, breaks=100)
+pdf(paste0(out_scenario, "/myfish_density.pdf"))
+plot(myfish)
+plot(mycountry.crop, add = T)
+dev.off()
+# r <- raster(ncol=26, nrow=19)
+# r <- raster(ncol=51, nrow=38)
+r <- raster(ncol=60, nrow=45)
+extent(r) <- extent(clipped_stack$Annual_range_in_SST)
+crs(r) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+values(r) <- 1
+r.mask_channel <- mask(r, channel_shp)
+
+myfish.crop <- projectRaster(myfish, r.mask_channel, method = 'ngb')
+myfish_mask <- mask(myfish.crop, r.mask_channel)
+myfish_mask <- rescale0to1(myfish_mask)
+hist(myfish_mask, breaks=100)
+# Use myfish_mask_rev - to minimize the cost on fishing
+
+r_tu <- rasterToPolygons(myfish_mask, fun=NULL, n=4, na.rm=TRUE, digits=12, dissolve=FALSE)
+colnames(r_tu@data)[1] = "cost"
+head(r_tu)
+# plot(r_tu)
+# build problem
+prio <- projectRaster(connectivity_map, r.mask_channel, method = 'ngb') # channel
+
+pdf(paste0(out_scenario, "/prioritization/spplot_fishing.pdf"))
+spplot(r_tu, "cost", main = "fishing")
+dev.off()
+
+library(prioritizr)
+col <- c("grey90", "darkgreen")
+p1 <- problem(r_tu, prio, cost_column = "cost") %>%
+  add_min_set_objective() %>%
+  add_relative_targets(0.17) %>% # should be 17?
+  add_binary_decisions() %>%
+  add_default_solver(gap = 0)
+
+## solve problem
+require(lpsymphony)
+s1 <- solve(p1)
+
+# visualize solution
+s1$solution_1 <- factor(s1$solution_1)
+spplot(s1, "solution_1", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution", add= T)
+
+# rasterize data
+r <- raster(s1, res=res(bathy.crop))
+r.polys <- rasterize(s1, r, field = s1@data[,2], fun = "mean", update = TRUE, updateValue = "NA")
+r.mask_s1 <- mask(r.polys, channel_shp)
+plot(mycountry.crop)
+plot(r.mask_s1, col=col, add=T)
+plot(mycountry.crop, add=T)
+
+
+
+pdf(paste0(out_scenario, "/prioritization/prio_scenario2b_s1.pdf"))
+plot(mycountry.crop)
+plot(r.mask_s1, col=col, add=T)
+plot(mycountry.crop, add=T)
+dev.off()
+
+# create new problem with boundary penalties added to it
+p2 <- p1 %>%
+  add_boundary_penalties(penalty = 1, edge_factor = 0.5)
+# Here we will use a penalty factor of 300 (i.e. boundary length modifier; BLM), and an edge factor of 50% so that planning units that occur outer edge of the study area are not overly penalized
+s2 <- solve(p2)
+s2$solution_2 <- factor(s2$solution_1)
+
+spplot(s2, "solution_2", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution", add= T)
+
+r <- raster(s2, res=res(bathy.crop))
+r.polys <- rasterize(s2, r, field = s2@data[,3], fun = "mean", update = TRUE, updateValue = "NA")
+r.mask_s2 <- mask(r.polys, channel_shp)
+
+pdf(paste0(out_scenario, "/prioritization/spplot_s2b_s2.pdf"))
+spplot(s2, "solution_2", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution", add= T)
+dev.off()
+
+pdf(paste0(out_scenario, "/prioritization/prio_scenario2b_s2.pdf"))
+plot(mycountry.crop)
+plot(r.mask_s2, col=col, add=T)
+plot(mycountry.crop, add=T)
+dev.off()
+
+
+
+
+# scenario #3
+# getting inverse of 
+# https://www.eea.europa.eu/data-and-maps/figures/combined-effects-of-human-activities-1
+HISea <- clipped_stack$humanImpact_sea
+pdf(paste0(out_scenario, "/prioritization/HISea.pdf"))
+plot(HISea)
+plot(mycountry.crop, add = T)
+dev.off()
+HISea <- rescale0to1(HISea)
+hist(HISea, breaks=100)
+# take inverse to focus on areas which have the most impact
+HISea_rev <- 1 - HISea
+plot(HISea_rev)
+
+HIland <- clipped_stack$humanImpact_land
+pdf(paste0(out_scenario, "/prioritization/HIland.pdf"))
+plot(HIland)
+plot(mycountry.crop, add = T)
+dev.off()
+HIland <- rescale0to1(HIland)
+hist(HIland, breaks=100)
+# take inverse to focus on areas which have the most impact
+HIland_rev <- 1 - HIland
+hist(HIland_rev, breaks=100)
+plot(HIland_rev)
+
+r <- raster(ncol=60, nrow=45)
+
+resI <- 1 - connectivity_map
+pdf(paste0(out_scenario, "/prioritization/resI.pdf"))
+plot(resI)
+plot(mycountry.crop, add = T)
+dev.off()
+resI <- rescale0to1(resI)
+hist(resI, breaks=100)
+# take inverse to focus on areas which have the most impact
+
+r <- raster(ncol=60, nrow=45)
+# r <- raster(ncol=26, nrow=19)
+extent(r) <- extent(clipped_stack$Annual_range_in_SST)
+crs(r) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+values(r) <- 1
+r.mask_channel <- mask(r, channel_shp)
+
+# HISea.crop <- projectRaster(HISea_rev, r.mask_channel, method = 'ngb')
+# HISea_mask <- mask(HISea.crop, r.mask_channel)
+# HISea_mask <- rescale0to1(HISea_mask)
+
+resI.crop <- projectRaster(resI, r.mask_channel, method = 'ngb')
+resI_mask <- mask(resI.crop, r.mask_channel)
+resI_mask <- rescale0to1(resI_mask)
+
+r_tu <- rasterToPolygons(resI_mask, fun=NULL, n=4, na.rm=TRUE, digits=12, dissolve=FALSE)
+colnames(r_tu@data)[1] = "cost"
+head(r_tu)
+
+pdf(paste0(out_scenario, "/prioritization/spplot_connectivity.pdf"))
+spplot(r_tu, "cost", main = "fishing")
+dev.off()
+
+
+# plot(r_tu)
+# build problem
+library(prioritizr)
+col <- c("grey90", "darkgreen")
+
+# myfish_mask_rev - areas of low fishing density, HIland_mask: high human impact on land and HISea_mask 
+this_stack <- stack(myfish_mask_rev, HIland_mask, HISea_mask)
+
+p1 <- problem(r_tu, this_stack, cost_column = "cost") %>%
+  add_min_set_objective() %>%
+  add_relative_targets(0.17) %>% # should be 17?
+  add_binary_decisions() %>%
+  add_default_solver(gap = 0)
+
+## solve problem
+require(lpsymphony)
+s1 <- solve(p1)
+
+# visualize solution
+s1$solution_1 <- factor(s1$solution_1)
+spplot(s1, "solution_1", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution")
+
+# rasterize data
+r <- raster(s1, res=res(bathy.crop))
+r.polys <- rasterize(s1, r, field = s1@data[,2], fun = "mean", update = TRUE, updateValue = "NA")
+r.mask_s1 <- mask(r.polys, channel_shp)
+plot(mycountry.crop)
+plot(r.mask_s1, col=col, add=T)
+plot(mycountry.crop, add=T)
+
+pdf(paste0(out_scenario, "/prioritization/prio_scenario3_s1.pdf"))
+plot(mycountry.crop)
+plot(r.mask_s1, col=col, add=T)
+plot(mycountry.crop, add=T)
+dev.off()
+
+# create new problem with boundary penalties added to it
+p2 <- p1 %>%
+  add_boundary_penalties(penalty = 1, edge_factor = 0.5)
+# Here we will use a penalty factor of 300 (i.e. boundary length modifier; BLM), and an edge factor of 50% so that planning units that occur outer edge of the study area are not overly penalized
+s2 <- solve(p2)
+s2$solution_2 <- factor(s2$solution_1)
+
+
+pdf(paste0(out_scenario, "/prioritization/spplot_s2_s2.pdf"))
+spplot(s2, "solution_2", col.regions = c("grey90", "darkgreen"),
+       main = "problem solution", add= T)
+dev.off()
+
+r <- raster(s2, res=res(bathy.crop))
+r.polys <- rasterize(s2, r, field = s2@data[,3], fun = "mean", update = TRUE, updateValue = "NA")
+r.mask_s2 <- mask(r.polys, channel_shp)
+
+pdf(paste0(out_scenario, "/prioritization/prio_scenario3_s2.pdf"))
+plot(mycountry.crop)
+plot(r.mask_s2, col=col, add=T)
+plot(mycountry.crop, add=T)
+dev.off()
+
